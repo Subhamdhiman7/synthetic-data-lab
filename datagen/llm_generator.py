@@ -1,19 +1,7 @@
 import logging
 from openai import OpenAI
-from .schemas import (
-    BinaryFeature,
-    CategoricalFeature,
-    CategoricalTerm,
-    ConstantTerm,
-    DatasetPlan,
-    LinearTerm,
-    NormalDist,
-    NumericalFeature,
-    UniformDist,
-    NoiseTerm,
-    WizardAnswers,
-    get_random_row_count,
-)
+from .rule_planner import infer_fallback_plan
+from .schemas import DatasetPlan, WizardAnswers, get_random_row_count
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +30,10 @@ def generate_dataset_plan(answers: WizardAnswers) -> DatasetPlan:
         )
 
         plan = response.output[0].content[0].parsed
+
+        if _is_degenerate_plan(plan):
+            logger.warning("LLM returned a generic schema; using semantic fallback planning")
+            return infer_fallback_plan(answers)
 
         # Add the computed row count to the plan
         rows = get_random_row_count(answers.size, answers.seed)
@@ -80,6 +72,7 @@ ROWS: {rows:,}
 SEED: {answers.seed}
 
 Create 5-20 realistic features with snake_case names, a target_name, and a file-safe dataset_name.
+Infer the schema from the description itself. Do not use feature_1, feature_2, or a generic target when the description contains domain concepts. A domain not represented by a template must still receive an inferred schema from the requested nouns and relationships. Use identifiers, categorical, binary, numerical, and derived features where appropriate; keep dependencies explicit in formulas.
 {task_guidance}
 Give 2-4 features a missing_rate of 0.05-0.15, the rest 0.0.
 Set rounding_precision from real-world context (integers for counts, 0.1 for ratings, 0.01 for prices, nearest_10/nearest_100 for large measurements, null to skip).
@@ -89,56 +82,14 @@ Set rounding_precision from real-world context (integers for counts, 0.1 for rat
 
 
 def generate_fallback_plan(answers: WizardAnswers) -> DatasetPlan:
-    """Generate a simple fallback plan if LLM fails."""
+    """Generate a semantic plan when the LLM is unavailable."""
 
-    logger.info("Using fallback plan generation")
+    logger.info("Using domain-independent rule-based fallback planning")
+    return infer_fallback_plan(answers)
 
-    rows = get_random_row_count(answers.size, answers.seed)
 
-    # Generate a simple dataset name from description
-    description = answers.custom_description or "generic dataset"
-    dataset_name = description.lower().replace(" ", "_").replace("-", "_")
-    # Remove special characters and limit length
-    dataset_name = "".join(c for c in dataset_name if c.isalnum() or c == "_")[:50]
-    if not dataset_name:
-        dataset_name = "fallback_dataset"
-
-    features = [
-        NumericalFeature(
-            name=f"feature_{i+1}",
-            distribution=NormalDist(mean=0, std=1),
-            domain_semantics=f"synthetic feature {i+1}",
-            missing_rate=0.05 if i == 1 else 0.0,
-            rounding_precision="0.01",
-        )
-        for i in range(8)
-    ]
-
-    if answers.task == "classification":
-        target_formula = [
-            ConstantTerm(value=0.0),
-            LinearTerm(feature="feature_1", coefficient=0.5),
-            LinearTerm(feature="feature_2", coefficient=0.5),
-            LinearTerm(feature="feature_3", coefficient=0.5),
-        ]
-    else:
-        target_formula = [
-            ConstantTerm(value=100.0),
-            LinearTerm(feature="feature_1", coefficient=5.0),
-            LinearTerm(feature="feature_2", coefficient=10.0),
-            LinearTerm(feature="feature_3", coefficient=15.0),
-            NoiseTerm(distribution=NormalDist(mean=0, std=10), coefficient=1.0),
-        ]
-
-    return DatasetPlan(
-        task=answers.task,
-        name="FallbackDataset",
-        description=f"A simple {answers.task} dataset: {answers.custom_description or 'generic'}",
-        dataset_name=dataset_name,
-        features=features,
-        target_name="target",
-        target_formula=target_formula,
-        domain=answers.domain,
-        seed=answers.seed,
-        rows=rows
+def _is_degenerate_plan(plan: DatasetPlan) -> bool:
+    """Detect a plan that ignored a specific user description."""
+    return bool(plan) and plan.target_name == "target" and bool(plan.features) and all(
+        feature.name.startswith("feature_") for feature in plan.features
     )

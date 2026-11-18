@@ -1,11 +1,51 @@
-.envrc
-.venv
-syntheticgen.log
-out/
-__pycache__/
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.production.example
 
-# Coverage files
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage
 .coverage
 .coverage.*
 htmlcov/
 coverage.xml
+
+# Local project data and generated files
+.venv/
+venv/
+out/
+backend_data/
+.phase6-ui/
+.ui-layout-check/
+
+# Temporary source dumps
+generator_source.txt
+main_source.txt
+
+# Logs
+*.log

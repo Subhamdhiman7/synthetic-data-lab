@@ -7,6 +7,7 @@ from typing import Optional
 import pandas as pd
 import questionary
 import typer
+from pydantic import ValidationError
 
 from .schemas import WizardAnswers, format_target_formula, get_random_row_count
 
@@ -18,23 +19,35 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(outdir: str, level: str = "WARNING"):
     """Setup logging to file and console."""
-    Path(outdir).mkdir(parents=True, exist_ok=True)
-    log_file = Path(outdir) / "syntheticgen.log"
+    output_dir = Path(outdir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / "syntheticgen.log"
+
+    # The CLI can be invoked repeatedly in one process (for example by an
+    # embedding application or a test runner). Remove only handlers installed
+    # by this function so messages are not duplicated and unrelated handlers
+    # remain intact.
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if getattr(handler, "_syntheticgen_handler", False):
+            root_logger.removeHandler(handler)
+            handler.close()
     
     # File handler with INFO level for debugging
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler._syntheticgen_handler = True
     file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     
     # Console handler with WARNING level to reduce noise
     console_handler = logging.StreamHandler()
+    console_handler._syntheticgen_handler = True
     console_handler.setLevel(getattr(logging, level.upper()))
     console_formatter = logging.Formatter('%(levelname)s: %(message)s')
     console_handler.setFormatter(console_formatter)
     
     # Root logger setup
-    root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
@@ -46,9 +59,15 @@ def setup_logging(outdir: str, level: str = "WARNING"):
     return logging.getLogger(__name__)
 
 
+def _cancel_wizard() -> None:
+    """Exit cleanly when the user cancels an interactive prompt."""
+    typer.echo("Cancelled.")
+    raise typer.Exit(0)
+
+
 def wizard_interview() -> WizardAnswers:
     """Interactive wizard to collect user requirements."""
-    typer.echo("🎯 Synthetic ML Dataset Generator")
+    typer.echo("Synthetic ML Dataset Generator")
     typer.echo("Let's create your dataset specification...")
     
     # Size preset
@@ -61,12 +80,17 @@ def wizard_interview() -> WizardAnswers:
             questionary.Choice("Very Large (~1M rows)", "very_large")
         ]
     ).ask()
+    if size is None:
+        _cancel_wizard()
     
     # Dataset description
     description = questionary.text(
         "Describe your dataset (e.g. 'customer churn prediction', 'car fuel efficiency', 'house prices'):",
         validate=lambda x: len(x.strip()) >= 5
     ).ask()
+    if description is None:
+        _cancel_wizard()
+    description = description.strip()
     
     # Auto-detect task type and determine other parameters
     description_lower = description.lower()
@@ -82,13 +106,22 @@ def wizard_interview() -> WizardAnswers:
                 questionary.Choice("Regression (predict numbers)", "regression")
             ]
         ).ask()
+        if task is None:
+            _cancel_wizard()
     
     # Seed
     seed_input = questionary.text(
         "Random seed (press enter for auto):",
         default=""
     ).ask()
-    seed = int(seed_input) if seed_input.strip() else random.randint(1, 1000000)
+    if seed_input is None:
+        _cancel_wizard()
+
+    try:
+        seed = int(seed_input) if seed_input.strip() else random.randint(1, 1000000)
+    except ValueError:
+        typer.echo("Seed must be an integer.")
+        raise typer.Exit(1)
     
     return WizardAnswers(
         task=task,
@@ -118,14 +151,27 @@ def main(
     try:
         # Handle existing plan file
         if plan:
-            typer.echo("🎯 Loading existing dataset plan...")
+            typer.echo("Loading existing dataset plan...")
             
             # Load plan from file
-            with open(plan, 'r') as f:
-                plan_data = json.load(f)
+            try:
+                with open(plan, 'r', encoding='utf-8') as f:
+                    plan_data = json.load(f)
+            except FileNotFoundError as e:
+                raise ValueError(f"Plan file not found: {plan}") from e
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON in plan '{plan}' at line {e.lineno}, "
+                    f"column {e.colno}: {e.msg}"
+                ) from e
+            except OSError as e:
+                raise ValueError(f"Could not read plan '{plan}': {e}") from e
             
             from .schemas import DatasetPlan
-            dataset_plan = DatasetPlan.model_validate(plan_data)
+            try:
+                dataset_plan = DatasetPlan.model_validate(plan_data)
+            except ValidationError as e:
+                raise ValueError(f"Invalid dataset plan '{plan}': {e}") from e
             
             # Create minimal answers for generation
             answers = WizardAnswers(
@@ -139,7 +185,7 @@ def main(
             )
             
             # Skip to generation step
-            typer.echo(f"✅ Loaded plan: {dataset_plan.name}")
+            typer.echo(f"Loaded plan: {dataset_plan.name}")
             typer.echo(f"   Features: {len(dataset_plan.features)}")
             typer.echo(f"   Target: {dataset_plan.target_name}")
             
@@ -160,31 +206,32 @@ def main(
                 )
             
             logger.info(f"Wizard answers: {answers}")
-            
-            # Use rows from plan if available, otherwise compute from size preset
-            if plan and dataset_plan.rows is not None:
-                rows = dataset_plan.rows
-                typer.echo(f"\n📋 Dataset Summary (from saved plan):")
-            else:
-                # Get randomized row count from size preset
-                rows = get_random_row_count(answers.size, answers.seed)
-                typer.echo(f"\n📋 Dataset Summary:")
-                
-            typer.echo(f"   Task: {answers.task}")
-            typer.echo(f"   Size: {answers.size} ({rows:,} rows)")
-            typer.echo(f"   Description: {answers.custom_description}")
-            typer.echo(f"   Seed: {answers.seed}")
-            
+
             if not plan:
                 # Generate LLM plan
-                typer.echo("\n🤖 Generating dataset specification...")
+                typer.echo("\nGenerating dataset specification...")
                 from .llm_generator import generate_dataset_plan
-                
+
                 dataset_plan = generate_dataset_plan(answers)
-        
+
+        # Display one consistent summary for loaded and newly generated plans.
+        # Prefer the row count stored in the plan.
+        if dataset_plan.rows is not None:
+            rows = dataset_plan.rows
+        else:
+            # Backward compatibility for older plans without an explicit row count.
+            rows = get_random_row_count(answers.size, answers.seed)
+
+        summary_label = " (from saved plan)" if plan else ""
+        typer.echo(f"\nDataset Summary{summary_label}:")
+        typer.echo(f"   Task: {answers.task}")
+        typer.echo(f"   Size: {answers.size} ({rows:,} rows)")
+        typer.echo(f"   Description: {answers.custom_description}")
+        typer.echo(f"   Seed: {answers.seed}")
+
         # Show plan to user (more readable)
         if not plan:  # Only show detailed plan for new generations
-            typer.echo(f"\n📋 Generated Plan:")
+            typer.echo(f"\nGenerated Plan:")
             typer.echo(f"   Name: {dataset_plan.name}")
             typer.echo(f"   Description: {dataset_plan.description}")
             typer.echo(f"   Features: {len(dataset_plan.features)}")
@@ -192,9 +239,9 @@ def main(
             # Show all features for approval
             typer.echo(f"   All features:")
             for feature in dataset_plan.features:
-                feature_type_emoji = {"numerical": "🔢", "categorical": "📝", "binary": "⚡"}.get(feature.type, "📊")
+                feature_type_label = {"numerical": "NUM", "categorical": "CAT", "binary": "BIN"}.get(feature.type, "DATA")
                 missing_info = f" (missing: {feature.missing_rate:.1%})" if getattr(feature, 'missing_rate', 0) > 0 else ""
-                typer.echo(f"     {feature_type_emoji} {feature.name}: {feature.domain_semantics}{missing_info}")
+                typer.echo(f"     [{feature_type_label}] {feature.name}: {feature.domain_semantics}{missing_info}")
             
             typer.echo(f"   Target: {dataset_plan.target_name}")
             typer.echo(f"   Target formula: {format_target_formula(dataset_plan.target_formula)}")
@@ -226,13 +273,13 @@ def main(
                     typer.echo("Cancelled.")
                     raise typer.Exit(0)
                 elif action == "Regenerate plan":
-                    typer.echo("🔄 Regenerating...")
+                    typer.echo("Regenerating...")
                     dataset_plan = generate_dataset_plan(answers)
         
         # Save plan (only for new plans, not existing ones)
         if not plan:
             outdir_path = Path(outdir)
-            outdir_path.mkdir(exist_ok=True)
+            outdir_path.mkdir(parents=True, exist_ok=True)
             
             # Use dataset name for plan file
             plan_filename = f"{getattr(dataset_plan, 'dataset_name', 'dataset')}_plan.json"
@@ -240,12 +287,12 @@ def main(
             with open(plan_file, 'w') as f:
                 json.dump(dataset_plan.model_dump(), f, indent=2)
             
-            typer.echo(f"\n✅ Plan saved to {plan_file}")
+            typer.echo(f"\nPlan saved to {plan_file}")
         else:
             plan_file = plan
         
         # Generate dataset
-        typer.echo("🎯 Generating synthetic dataset...")
+        typer.echo("Generating synthetic dataset...")
         from .generator import generate_dataset
         
         answers_dict = answers.model_dump()
@@ -253,7 +300,7 @@ def main(
         
         # Show preview
         df = pd.read_csv(dataset_file)
-        typer.echo(f"\n📊 Dataset Preview:")
+        typer.echo(f"\nDataset Preview:")
         typer.echo(f"   Shape: {df.shape}")
         typer.echo(f"   Files: {dataset_file}, {report_file}")
         typer.echo(f"\n{df.head()}")
@@ -262,7 +309,7 @@ def main(
         
     except Exception as e:
         logger.error(f"Generation failed: {e}")
-        typer.echo(f"❌ Error: {e}")
+        typer.echo(f"Error: {e}")
         raise typer.Exit(1)
 
 

@@ -1,0 +1,12 @@
+import { ArrowDownToLine, ExternalLink } from "lucide-react";
+import { Link } from "react-router-dom";
+import type { GenerationMetadata } from "../types/api";
+import { getDownloadUrl } from "../lib/api";
+import { formatDate, formatNumber } from "../lib/format";
+import { TaskBadge } from "./ui";
+import { motion } from "framer-motion";
+
+export function DatasetTable({ items, emptyMessage = "No generated datasets yet." }: { items: GenerationMetadata[]; emptyMessage?: string }) {
+  if (items.length === 0) return <p className="px-5 py-12 text-center text-sm text-slate-500">{emptyMessage}</p>;
+  return <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="border-b border-line text-[10px] uppercase tracking-[.16em] text-slate-500"><tr><th className="px-5 py-4 font-semibold">Dataset</th><th className="px-5 py-4 font-semibold">Task</th><th className="px-5 py-4 font-semibold">Rows</th><th className="px-5 py-4 font-semibold">Features</th><th className="px-5 py-4 font-semibold">Generated</th><th className="px-5 py-4 font-semibold">Actions</th></tr></thead><tbody>{items.map((item, index) => <motion.tr key={item.generation_id} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: index * .035, duration: .3 }} className="table-row"><td className="px-5 py-4"><Link to={`/datasets/${item.generation_id}`} className="font-medium text-slate-100 hover:text-cyan">{item.dataset_name}</Link><p className="mt-1 font-mono text-[10px] text-slate-600">{item.generation_id.slice(0, 12)}…</p></td><td className="px-5 py-4"><TaskBadge task={item.task} /></td><td className="px-5 py-4 font-mono text-xs text-slate-300">{formatNumber(item.rows)}</td><td className="px-5 py-4 font-mono text-xs text-slate-300">{formatNumber(item.feature_count)}</td><td className="px-5 py-4 text-xs text-slate-400">{formatDate(item.created_at)}</td><td className="px-5 py-4"><div className="flex items-center gap-1"><Link to={`/datasets/${item.generation_id}`} aria-label={`View ${item.dataset_name}`} className="rounded-lg p-2 text-slate-500 hover:bg-panelSoft hover:text-cyan" title="View details"><ExternalLink size={16} /></Link><a href={getDownloadUrl(item.generation_id)} aria-label={`Download ${item.dataset_name} CSV`} className="rounded-lg p-2 text-slate-500 hover:bg-panelSoft hover:text-mint" title="Download CSV"><ArrowDownToLine size={16} /></a></div></td></motion.tr>)}</tbody></table></div>;
+}

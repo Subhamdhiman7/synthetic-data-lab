@@ -16,6 +16,7 @@ from .schemas import (
     DerivedNumericalFeature,
     Feature,
     FeatureBounds,
+    IdentifierFeature,
     LinearTerm,
     MissingnessRule,
     LogNormalDist,
@@ -24,6 +25,7 @@ from .schemas import (
     NumericalDistribution,
     NumericalFeature,
     PoissonDist,
+    ProductTerm,
     TargetTerm,
     UniformDist,
     get_random_row_count,
@@ -51,12 +53,11 @@ class DatasetGenerator:
         # previously generated columns, which makes domain relationships
         # explicit and deterministic.
         feature_data = {}
+        deferred_features = []
         for feature in self.plan.features:
             logger.info(f"Generating feature: {feature.name}")
             if isinstance(feature, DerivedNumericalFeature):
-                feature_data[feature.name] = self._generate_derived_feature(
-                    feature, pd.DataFrame(feature_data)
-                )
+                deferred_features.append(feature)
             else:
                 feature_data[feature.name] = self._generate_feature(feature)
 
@@ -67,6 +68,15 @@ class DatasetGenerator:
         df = self._apply_bounds(df)
 
         # Apply rounding to numerical features
+        df = self._apply_rounding(df)
+
+        # Evaluate derived features after their source columns have been
+        # rounded. This keeps visible relationships such as
+        # monthly_charges * tenure_months == total_charges coherent in the
+        # exported CSV, not just in hidden unrounded intermediates.
+        for feature in deferred_features:
+            df[feature.name] = self._generate_derived_feature(feature, df)
+        df = self._apply_bounds(df)
         df = self._apply_rounding(df)
 
         # Generate target with correct column name
@@ -106,6 +116,8 @@ class DatasetGenerator:
             return self._generate_categorical_feature(feature)
         elif isinstance(feature, BinaryFeature):
             return self._generate_binary_feature(feature.p)
+        elif isinstance(feature, IdentifierFeature):
+            return self._generate_identifier_feature(feature)
         else:
             raise ValueError(f"Unsupported feature type: {getattr(feature, 'type', type(feature))}")
 
@@ -130,6 +142,8 @@ class DatasetGenerator:
         for term in terms:
             if isinstance(term, (LinearTerm, CategoricalTerm)):
                 references.append(term.feature)
+            elif isinstance(term, ProductTerm):
+                references.extend(term.features)
         return references
 
     def _generate_numerical_feature(self, dist: NumericalDistribution) -> np.ndarray:
@@ -164,6 +178,11 @@ class DatasetGenerator:
     def _generate_binary_feature(self, p: float = 0.5) -> np.ndarray:
         """Generate binary feature."""
         return self.rng.binomial(1, p, self.rows)
+
+    def _generate_identifier_feature(self, feature: IdentifierFeature) -> np.ndarray:
+        """Generate stable, unique, human-readable identifiers."""
+        width = max(4, len(str(self.rows)))
+        return np.array([f"{feature.prefix}{index:0{width}d}" for index in range(1, self.rows + 1)])
 
     def _generate_classification_target(self, df: pd.DataFrame) -> np.ndarray:
         """Generate a classification target from a latent score.
@@ -241,6 +260,13 @@ class DatasetGenerator:
                 if term.feature in df.columns:
                     indicator = (df[term.feature] == term.value).astype(int)
                     result += term.coefficient * indicator
+
+            elif isinstance(term, ProductTerm):
+                if all(feature in df.columns for feature in term.features):
+                    product = np.ones(len(df))
+                    for feature in term.features:
+                        product *= pd.to_numeric(df[feature], errors="coerce").fillna(0).to_numpy()
+                    result += term.coefficient * product
 
             elif isinstance(term, ConstantTerm):
                 result += term.value
@@ -432,7 +458,9 @@ class DatasetGenerator:
 
         # Global outliers from wizard answers
         global_outliers = self.answers.get('outliers', "none")
-        global_rate = self._get_outliers_rate(global_outliers)
+        global_rate = float(getattr(self.plan, "outlier_rate", 0.0) or 0.0)
+        if global_rate <= 0:
+            global_rate = self._get_outliers_rate(global_outliers)
 
         # Apply global outliers to numerical features
         if global_rate > 0:
@@ -513,7 +541,16 @@ class DatasetGenerator:
             if col == self.plan.target_name:
                 continue
 
-            if pd.api.types.is_numeric_dtype(df[col]):
+            feature_spec = next((feature for feature in self.plan.features if feature.name == col), None)
+            if isinstance(feature_spec, IdentifierFeature):
+                value_counts = df[col].value_counts().head(5).to_dict()
+                report["feature_stats"][col] = {
+                    "type": "identifier",
+                    "unique_values": int(df[col].nunique()),
+                    "top_values": {str(k): int(v) for k, v in value_counts.items()},
+                    "missing_rate": float(df[col].isna().mean()),
+                }
+            elif pd.api.types.is_numeric_dtype(df[col]):
                 report["feature_stats"][col] = {
                     "type": "numerical",
                     "mean": float(df[col].mean()) if not df[col].isna().all() else None,
@@ -539,16 +576,21 @@ class DatasetGenerator:
         for feature in self.plan.features:
             if isinstance(feature, DerivedNumericalFeature):
                 for term in feature.formula:
-                    if not isinstance(term, LinearTerm):
+                    if isinstance(term, ProductTerm):
+                        referenced_features = term.features
+                    elif isinstance(term, LinearTerm):
+                        referenced_features = [term.feature]
+                    else:
                         continue
-                    if term.feature not in df.columns or feature.name not in df.columns:
-                        continue
-                    pair = df[[term.feature, feature.name]].dropna()
-                    if len(pair) >= 2 and pd.api.types.is_numeric_dtype(pair[term.feature]):
-                        report["relationship_stats"][f"{term.feature}->{feature.name}"] = {
-                            "coefficient": term.coefficient,
-                            "correlation": float(pair[term.feature].corr(pair[feature.name])),
-                        }
+                    for referenced in referenced_features:
+                        if referenced not in df.columns or feature.name not in df.columns:
+                            continue
+                        pair = df[[referenced, feature.name]].dropna()
+                        if len(pair) >= 2 and pd.api.types.is_numeric_dtype(pair[referenced]):
+                            report["relationship_stats"][f"{referenced}->{feature.name}"] = {
+                                "coefficient": term.coefficient,
+                                "correlation": float(pair[referenced].corr(pair[feature.name])),
+                            }
 
             if not isinstance(feature, (NumericalFeature, DerivedNumericalFeature)):
                 continue
@@ -590,7 +632,7 @@ def generate_dataset(plan_file: str, answers: dict, output_dir: str = ".") -> Tu
 
     # Save dataset
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     # Use custom dataset name from plan
     dataset_name = getattr(plan, 'dataset_name', 'dataset')

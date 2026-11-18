@@ -27,6 +27,94 @@ uv sync
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
+## Backend API and analysis dashboard
+
+The Phase 2 backend is a thin FastAPI layer around the existing generator. It
+uses local SQLite metadata and filesystem artifacts by default.
+
+```bash
+uv sync
+uv run uvicorn backend.main:app --host 127.0.0.1 --port 8001 --reload
+```
+
+The Swagger UI is available at `http://127.0.0.1:8001/docs`. Set
+`SYNTHETIC_DATA_LAB_STORAGE` to choose a different local storage directory.
+The API falls back to the deterministic plan generator when no OpenAI API key
+is configured.
+
+Phase 4 adds a read-only analysis endpoint for every generation:
+
+```text
+GET /api/datasets/{generation_id}/analysis
+GET /api/datasets/{generation_id}/analysis/report
+```
+
+The analysis profiles every column, reports numerical summaries and histograms,
+categorical frequencies, missingness, duplicates, constants, high cardinality,
+IQR outliers, invalid/infinite values, class imbalance, Pearson/Spearman target
+associations, and a correlation matrix. The quality score is a documented
+weighted heuristic across applicable dimensions; it is not a privacy guarantee
+or a model-performance estimate. The HTML export is generated locally from the
+same response payload. The React dashboard consumes these endpoints and keeps
+empty or unavailable states explicit.
+
+### Frontend startup
+
+Install the frontend dependencies and start Vite in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The dashboard defaults to `http://127.0.0.1:8001`. Set `VITE_API_URL` before
+the Vite command when the backend runs elsewhere. `VITE_API_URL` is a public
+browser URL, not a secret; do not put API keys in frontend environment files.
+
+### Environment variables and storage
+
+- `OPENAI_API_KEY` is optional. Without it, the deterministic fallback plan
+  generator is used and no paid API call is made.
+- `SYNTHETIC_DATA_LAB_STORAGE` selects the backend's local SQLite/artifact
+  directory. The default is `backend_data`.
+- `SYNTHETIC_DATA_LAB_FRONTEND_ORIGINS` is a comma-separated CORS allow-list.
+  The default allows only `localhost:5173` and `127.0.0.1:5173`.
+
+Generated plans, SQLite history, CSV files, and reports remain under the
+configured storage directory. Do not place that directory in a public web
+root. The backend validates UUID identifiers, confines stored artifact paths to
+the storage root, uses atomic plan writes, and returns generic internal errors.
+
+### Testing and local deployment
+
+```bash
+uv run pytest -q
+uv run pytest --cov=datagen --cov=backend --cov-report=term-missing -q
+cd frontend
+npm run typecheck
+npm run build
+```
+
+For local deployment, start Uvicorn bound to loopback and serve the built
+frontend through a local static server or the Vite preview command. This
+project is intentionally not configured for public exposure: before doing so,
+add authentication, TLS, rate limiting, access logging, secret management,
+backups, and a reviewed storage policy.
+
+### Known limitations and licensing
+
+Analysis currently reads the selected CSV into pandas, so very large datasets
+need sufficient local memory. CSV downloads are intended for local use and
+should not be opened in a spreadsheet when values come from an untrusted plan;
+public deployments should add a formula-injection-safe export policy. The
+application has no authentication and is single-user/local by design.
+
+The upstream Datagen repository's license and redistribution rights have not
+been verified in this workspace. Preserve original attribution and verify the
+upstream license, dependency licenses, and permission to redistribute the
+generator before any public release or bundled distribution.
+
 ## Quick Start
 
 ### Interactive Mode (Recommended)

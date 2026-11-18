@@ -2,18 +2,10 @@ from typing import Annotated, List, Literal, Optional, Union
 import random
 from pydantic import BaseModel, Field
 
-# Type aliases using literals
+# Type aliases. Domains are intentionally open-ended: the description is the
+# source of truth, while the optional domain field only provides planning hints.
 TaskType = Literal["classification", "regression"]
-Domain = Literal[
-    "finance",
-    "healthcare",
-    "ecommerce",
-    "marketing",
-    "automotive",
-    "iot",
-    "hr",
-    "generic",
-]
+Domain = str
 SizePreset = Literal["small", "medium", "large", "very_large"]
 
 
@@ -89,6 +81,16 @@ class BinaryFeature(BaseModel):
     missing_rate: float = 0.0
 
 
+class IdentifierFeature(BaseModel):
+    """A reproducible unique identifier generated from a prefix."""
+
+    name: str
+    type: Literal["identifier"] = "identifier"
+    prefix: str = "ID"
+    domain_semantics: str = ""
+    missing_rate: float = 0.0
+
+
 Feature = Annotated[
     Union[NumericalFeature, CategoricalFeature, BinaryFeature],
     Field(discriminator="type"),
@@ -110,6 +112,14 @@ class CategoricalTerm(BaseModel):
     coefficient: float = 1.0
 
 
+class ProductTerm(BaseModel):
+    """A multiplicative dependency such as monthly_charge * tenure."""
+
+    kind: Literal["product"] = "product"
+    features: List[str]
+    coefficient: float = 1.0
+
+
 class ConstantTerm(BaseModel):
     kind: Literal["constant"] = "constant"
     value: float = 0.0
@@ -122,7 +132,7 @@ class NoiseTerm(BaseModel):
 
 
 TargetTerm = Annotated[
-    Union[LinearTerm, CategoricalTerm, ConstantTerm, NoiseTerm],
+    Union[LinearTerm, CategoricalTerm, ProductTerm, ConstantTerm, NoiseTerm],
     Field(discriminator="kind"),
 ]
 
@@ -146,7 +156,7 @@ class DerivedNumericalFeature(BaseModel):
 # Rebind the union after the target terms and derived feature are defined. The
 # DatasetPlan below sees this complete union; existing plans remain valid.
 Feature = Annotated[
-    Union[NumericalFeature, CategoricalFeature, BinaryFeature, DerivedNumericalFeature],
+    Union[NumericalFeature, CategoricalFeature, BinaryFeature, IdentifierFeature, DerivedNumericalFeature],
     Field(discriminator="type"),
 ]
 
@@ -179,6 +189,8 @@ def format_target_formula(terms: List[TargetTerm]) -> str:
             parts.append(f"{t.coefficient}*{t.feature}")
         elif isinstance(t, CategoricalTerm):
             parts.append(f"{t.coefficient}*[{t.feature}=={t.value}]")
+        elif isinstance(t, ProductTerm):
+            parts.append(f"{t.coefficient}*{'*'.join(t.features)}")
         elif isinstance(t, ConstantTerm):
             parts.append(f"{t.value}")
         elif isinstance(t, NoiseTerm):
@@ -208,6 +220,7 @@ class DatasetPlan(BaseModel):
     classification: Optional[ClassificationConfig] = None
     target_rounding_precision: Optional[str] = None
     target_noise_scale: Optional[float] = None
+    outlier_rate: float = 0.0
 
 
 class WizardAnswers(BaseModel):
